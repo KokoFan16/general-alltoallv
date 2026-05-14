@@ -1,0 +1,12 @@
+# Build artifacts
+*.o
+*.dSYM/
+
+# Example binaries
+example/gata_example
+example/gata_gpu_example
+example/gata_uniform_example
+example/gata_uniform_gpu_example
+
+# OS junk
+.DS_Store

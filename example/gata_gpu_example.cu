@@ -1,9 +1,7 @@
 /*
  * gata_gpu_example.cu
  *
- * Example driver for tuna2_gpu_algorithm. Allocates host send/recv buffers
- * for initialization and verification, mirrors them onto the device, runs
- * the GPU alltoallv, then copies the result back to verify.
+ * Driver for gata_gpu_algorithm (uniform alltoall on GPU).
  *
  * Assumes a CUDA-aware MPI is available.
  */
@@ -59,48 +57,23 @@ static void run_gata_gpu(int loopcount, int nprocs, std::vector<int> bases) {
     int mpi_errno = MPI_SUCCESS;
     int basecount = bases.size();
 
-    for (int n = 1024; n <= 1024; n = n * 2) {
+    for (int n = 2; n <= 1024; n = n * 2) {
 
-        int sendcounts[nprocs];
-        memset(sendcounts, 0, nprocs * sizeof(int));
-        int sdispls[nprocs];
-        int soffset = 0;
-
-        srand(time(NULL));
-        for (int i = 0; i < nprocs; i++) sendcounts[i] = n;
-
-        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-        std::shuffle(&sendcounts[0], &sendcounts[nprocs], std::default_random_engine(seed));
-
-        for (int i = 0; i < nprocs; i++) {
-            sdispls[i] = soffset;
-            soffset += sendcounts[i];
-        }
-
-        int recvcounts[nprocs];
-        MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
-        int rdispls[nprocs];
-        int roffset = 0;
-        for (int i = 0; i < nprocs; i++) {
-            rdispls[i] = roffset;
-            roffset += recvcounts[i];
-        }
-
-        // Host buffers (for init & verification)
-        long long *h_send = new long long[soffset];
-        long long *h_recv = new long long[roffset];
+        // Host buffers (init & verification)
+        long long *h_send = new long long[(size_t)nprocs * n];
+        long long *h_recv = new long long[(size_t)nprocs * n];
 
         int index = 0;
         for (int i = 0; i < nprocs; i++)
-            for (int j = 0; j < sendcounts[i]; j++)
+            for (int j = 0; j < n; j++)
                 h_send[index++] = i + rank * 10;
 
         // Device buffers
         long long *d_send = nullptr;
         long long *d_recv = nullptr;
-        CUDA_CHECK(cudaMalloc((void**)&d_send, soffset * sizeof(long long)));
-        CUDA_CHECK(cudaMalloc((void**)&d_recv, roffset * sizeof(long long)));
-        CUDA_CHECK(cudaMemcpy(d_send, h_send, soffset * sizeof(long long),
+        CUDA_CHECK(cudaMalloc((void**)&d_send, (size_t)nprocs * n * sizeof(long long)));
+        CUDA_CHECK(cudaMalloc((void**)&d_recv, (size_t)nprocs * n * sizeof(long long)));
+        CUDA_CHECK(cudaMemcpy(d_send, h_send, (size_t)nprocs * n * sizeof(long long),
                               cudaMemcpyHostToDevice));
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -109,29 +82,34 @@ static void run_gata_gpu(int loopcount, int nprocs, std::vector<int> bases) {
             int b = 2;
             for (int it = 0; it < loopcount; it++) {
                 double st = MPI_Wtime();
-                mpi_errno = tuna2_gpu_algorithm(bases[i], b,
-                        (char*)d_send, sendcounts, sdispls, MPI_UNSIGNED_LONG_LONG,
-                        (char*)d_recv, recvcounts, rdispls, MPI_UNSIGNED_LONG_LONG,
+                mpi_errno = gata_gpu_algorithm(bases[i], b,
+                        (char*)d_send, n, MPI_UNSIGNED_LONG_LONG,
+                        (char*)d_recv, n, MPI_UNSIGNED_LONG_LONG,
                         MPI_COMM_WORLD);
                 double et = MPI_Wtime();
                 double total_time = et - st;
 
                 if (mpi_errno != MPI_SUCCESS)
-                    std::cout << "tuna2_gpu_algorithm fail!\n";
+                    std::cout << "gata_gpu_algorithm fail!\n";
 
                 // Copy result back for verification
-                CUDA_CHECK(cudaMemcpy(h_recv, d_recv, roffset * sizeof(long long),
+                CUDA_CHECK(cudaMemcpy(h_recv, d_recv, (size_t)nprocs * n * sizeof(long long),
                                       cudaMemcpyDeviceToHost));
 
-                int error = check_errors(recvcounts, h_recv, rank, nprocs);
+                int error = 0;
+                for (int p = 0; p < nprocs; p++) {
+                    for (int s = 0; s < n; s++) {
+                        if ((h_recv[p*n + s] % 10) != (rank % 10)) error++;
+                        if (p != 0 && h_recv[p*n + s] == 0) error++;
+                    }
+                }
                 if (error > 0) {
                     std::cout << rank << " " << n << " " << b
                               << " [gata-GPU] base " << bases[i] << " has errors\n";
                 }
 
                 double max_time = 0;
-                MPI_Allreduce(&total_time, &max_time, 1, MPI_DOUBLE, MPI_MAX,
-                              MPI_COMM_WORLD);
+                MPI_Allreduce(&total_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
                 if (total_time == max_time) {
                     std::cout << "[gata-GPU] " << nprocs << ", " << n << ", "
                               << b << ", " << bases[i] << ", " << max_time << '\n';

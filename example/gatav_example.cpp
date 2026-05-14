@@ -1,13 +1,14 @@
 /*
- * gata_uniform_example.cpp
+ * gatav_example.cpp
  *
- *  Driver for gata_algorithm (uniform alltoall).
+ *  Created on: Jul 09, 2022
+ *      Author: kokofan
  */
 
 #include "../src/gAta.h"
 
 static int rank, nprocs;
-static void run_gata_uniform(int loopcount, int nprocs, std::vector<int> bases);
+static void run_gata(int loopcount, int nprocs, std::vector<int> bases);
 
 int main(int argc, char **argv) {
 	if (MPI_Init(&argc, &argv) != MPI_SUCCESS)
@@ -28,26 +29,50 @@ int main(int argc, char **argv) {
 	for (int i = 2; i < argc; i++)
 		bases.push_back(atoi(argv[i]));
 
-	run_gata_uniform(loopCount, nprocs, bases);
+	run_gata(loopCount, nprocs, bases);
 
 	MPI_Finalize();
 	return 0;
 }
 
 
-static void run_gata_uniform(int loopcount, int nprocs, std::vector<int> bases) {
+static void run_gata(int loopcount, int nprocs, std::vector<int> bases) {
 
 	int mpi_errno = MPI_SUCCESS;
 	int basecount = bases.size();
 	for (int n = 2; n <= 1024; n = n * 2) {
 
-		// Uniform: every pair exchanges exactly `n` long-longs
-		long long* send_buffer = new long long[(size_t)nprocs * n];
-		long long* recv_buffer = new long long[(size_t)nprocs * n];
+		int sendcounts[nprocs];
+		memset(sendcounts, 0, nprocs*sizeof(int));
+		int sdispls[nprocs];
+		int soffset = 0;
+
+		srand(time(NULL));
+		for (int i = 0; i < nprocs; i++) sendcounts[i] = n;
+
+		unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+		std::shuffle(&sendcounts[0], &sendcounts[nprocs], std::default_random_engine(seed));
+
+		for (int i = 0; i < nprocs; ++i) {
+			sdispls[i] = soffset;
+			soffset += sendcounts[i];
+		}
+
+		int recvcounts[nprocs];
+		MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
+		int rdispls[nprocs];
+		int roffset = 0;
+		for (int i = 0; i < nprocs; ++i) {
+			rdispls[i] = roffset;
+			roffset += recvcounts[i];
+		}
+
+		long long* send_buffer = new long long[soffset];
+		long long* recv_buffer = new long long[roffset];
 
 		int index = 0;
 		for (int i = 0; i < nprocs; i++) {
-			for (int j = 0; j < n; j++)
+			for (int j = 0; j < sendcounts[i]; j++)
 				send_buffer[index++] = i + rank * 10;
 		}
 
@@ -57,24 +82,16 @@ static void run_gata_uniform(int loopcount, int nprocs, std::vector<int> bases) 
 			int b = 2;
 			for (int it = 0; it < loopcount; it++) {
 				double st = MPI_Wtime();
-				mpi_errno = gata_algorithm(bases[i], b,
-						(char*)send_buffer, n, MPI_UNSIGNED_LONG_LONG,
-						(char*)recv_buffer, n, MPI_UNSIGNED_LONG_LONG,
-						MPI_COMM_WORLD);
+				mpi_errno = tuna2_algorithm(bases[i], b, (char*)send_buffer, sendcounts, sdispls,
+						MPI_UNSIGNED_LONG_LONG, (char*)recv_buffer, recvcounts, rdispls,
+						MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
 				double et = MPI_Wtime();
 				double total_time = et - st;
 
 				if (mpi_errno != MPI_SUCCESS)
-					std::cout << "gata_algorithm fail!" << std::endl;
+					std::cout << "tuna2_algorithm fail!" << std::endl;
 
-				// correctness: recv_buffer[i*n + j] should hold (rank + i*10)
-				int error = 0;
-				for (int p = 0; p < nprocs; p++) {
-					for (int s = 0; s < n; s++) {
-						if ((recv_buffer[p*n + s] % 10) != (rank % 10)) error++;
-						if (p != 0 && recv_buffer[p*n + s] == 0) error++;
-					}
-				}
+				int error = check_errors(recvcounts, recv_buffer, rank, nprocs);
 				if (error > 0) {
 					std::cout << rank << " " << n << " " << b
 					          << " [gata] base " << bases[i] << " has errors" << std::endl;

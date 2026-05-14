@@ -19,14 +19,14 @@ GATA_OBJ        := src/gAta.o
 GATAGPU_OBJ     := src/gAta_gpu.o
 
 # Examples
-GATAV_EX_SRC       := example/gata_example.cpp
-GATAVGPU_EX_SRC    := example/gata_gpu_example.cu
-GATA_EX_SRC        := example/gata_uniform_example.cpp
-GATAGPU_EX_SRC     := example/gata_uniform_gpu_example.cu
-GATAV_EX_BIN       := example/gata_example
-GATAVGPU_EX_BIN    := example/gata_gpu_example
-GATA_EX_BIN        := example/gata_uniform_example
-GATAGPU_EX_BIN     := example/gata_uniform_gpu_example
+GATAV_EX_SRC       := example/gatav_example.cpp
+GATAVGPU_EX_SRC    := example/gatav_gpu_example.cu
+GATA_EX_SRC        := example/gata_example.cpp
+GATAGPU_EX_SRC     := example/gata_gpu_example.cu
+GATAV_EX_BIN       := example/gatav_example
+GATAVGPU_EX_BIN    := example/gatav_gpu_example
+GATA_EX_BIN        := example/gata_example
+GATAGPU_EX_BIN     := example/gata_gpu_example
 
 # Headers (for dependency tracking)
 HDRS := src/gAta.h gata_common.h

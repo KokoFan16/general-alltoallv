@@ -139,15 +139,12 @@ static void run_gata(int loopcount, int nprocs, std::vector<int> bases) {
 					(char*)recv_buffer, n, MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
 			});
 
-			// --- rbruck (modified inverse, uniform) for each base ---
-			for (size_t i = 0; i < bases.size(); i++) {
-				int r = bases[i];
-				bench("rbruck", n, nprocs, r, 0, send_buffer, recv_buffer, [&]{
-					uniform_modified_inverse_r_bruck(r,
-						(char*)send_buffer, n, MPI_UNSIGNED_LONG_LONG,
-						(char*)recv_buffer, n, MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
-				});
-			}
+			// --- classic binary Bruck (r=2, no tuning) ---
+			bench("Bruck", n, nprocs, 0, 0, send_buffer, recv_buffer, [&]{
+				basic_bruck_alltoall(
+					(char*)send_buffer, n, MPI_UNSIGNED_LONG_LONG,
+					(char*)recv_buffer, n, MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+			});
 
 			// --- gata_algorithm (your implementation) ---
 			// Sweep r (radix) over user-provided bases. For each r, sweep b

@@ -20,7 +20,7 @@ of the most common reference implementations used inside MPICH and OpenMPI.
 | Reference | `benchmarks/OpenMPI_pairwise_{ata,atav}.cpp`     | OpenMPI pairwise |
 | Reference | `benchmarks/MPICH_scattered_{ata,atav}.cpp`      | MPICH scattered (with `b` batching) |
 | Reference | `benchmarks/spreadout_{ata,atav}.cpp`            | spread-out (rotated post order) |
-| Reference | `benchmarks/rbruck_ata.cpp`                      | inverse modified r-Bruck (uniform) |
+| Reference | `benchmarks/bruck_ata.cpp`                       | classic binary Bruck (uniform, r=2) |
 | Reference | `benchmarks/exclusive_or_atav.cpp`               | XOR-based (P must be power of 2) |
 
 Naming convention:
@@ -47,7 +47,7 @@ general-alltoallv/
     └── gatav_gpu_example.cu   # GPU,  non-uniform alltoallv
 ```
 
-After `make`, all `.o` files and binaries land in `build/`.
+After `make`, all `.o` files and binaries land in `build/` (ignored by git).
 
 ## Build
 
@@ -79,9 +79,9 @@ mpirun -n 8 ./build/gata_example  <loop_count> <base_list>
 mpirun -n 8 ./build/gatav_example <loop_count> <base_list>
 ```
 
-`base_list` is a space-separated list of radix `r` values to sweep through.
-For each `r`, the example also sweeps `b` (bblock) over **powers of 2 plus
-`r-1`**:
+`base_list` is a space-separated list of radix `r` values for `gata` /
+`gatav` to sweep through. For each `r`, the example also sweeps `b` over
+**powers of 2 plus `r-1`**:
 
 | `r` | swept `b` values |
 |---|---|
@@ -92,7 +92,11 @@ For each `r`, the example also sweeps `b` (bblock) over **powers of 2 plus
 | 1024| `{1, 2, 4, 8, …, 512, 1023}` |
 | 8192| `{1, 2, 4, …, 4096, 8191}` |
 
-This keeps the sweep at `O(log P)` instead of `O(P)`.
+`MPICH-scattered` sweeps its own `b` independently, over **powers of 2 plus
+`P`** (e.g. for `P=8`: `{1, 2, 4, 8}`). The remaining algorithms have no
+tunable parameter and run once per `n`.
+
+All `b` sweeps are `O(log P)`, so even `P = 8192` stays under ~15 b values.
 
 Examples:
 ```bash
@@ -121,8 +125,8 @@ Every benchmarked call prints one line of CSV-friendly output:
 | `OMPI-pairwise`    | 0      | 0      | OpenMPI pairwise |
 | `MPICH-scattered`  | `b`    | 0      | MPICH scattered (b sweep) |
 | `Spreadout`        | 0      | 0      | spread-out |
-| `rbruck` (ata only) | `r`   | 0      | inverse modified r-Bruck |
-| `XOR` (atav only)   | 0     | 0      | XOR (only printed when P is power of 2) |
+| `Bruck` (ata only)  | 0      | 0      | classic binary Bruck (r=2 hardcoded) |
+| `XOR` (atav only)   | 0      | 0      | XOR (only printed when P is power of 2) |
 | `gata`             | `b`    | `r`    | our uniform alltoall |
 | `gatav`            | `b`    | `r`    | our non-uniform alltoallv |
 
@@ -139,9 +143,9 @@ Correctness is verified after every call:
 - After alltoall(v), rank `R`'s slot `p` must contain `R + p*10`.
 - Any violation prints `[<tag>] rank R n=N has errors`.
 
-`sendbuf` is reset before every call (some reference algorithms — e.g.
-`rbruck_ata` — reuse `sendbuf` as scratch), so each algorithm sees the same
-input. **Reset is outside the timer.**
+`sendbuf` is reset before every call so each algorithm sees the same input
+even if a future implementation reuses `sendbuf` as scratch. **Reset is
+outside the timer.**
 
 ## Algorithm parameters
 
@@ -173,8 +177,10 @@ require a CUDA-aware MPI.
 | medium                  | 3–8              | mid (~`r/2`)            |
 | large (> 1 MB)          | small (2–4)      | small (1–2, less contention) |
 
-The benchmark harness sweeps the full `(r, b)` grid, so the optimum for a
-given system + message size shows up directly in the timing table.
+The benchmark harness sweeps the `(r, b)` grid, so the optimum for a given
+system + message size shows up directly in the timing table — pipe the
+output to a CSV-like file and plot, or just `grep '\[gata\]'` then sort by
+the last column.
 
 ## GPU notes
 

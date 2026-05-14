@@ -49,7 +49,7 @@ int MPICH_intra_scattered_ata(int b, char *sendbuf, int sendcount, MPI_Datatype 
 void spreadout_alltoall(char *sendbuf, int sendcount, MPI_Datatype sendtype,
 		char *recvbuf, int recvcount, MPI_Datatype recvtype, MPI_Comm comm);
 
-void uniform_modified_inverse_r_bruck(int r, char *sendbuf, int sendcount, MPI_Datatype sendtype,
+void basic_bruck_alltoall(char *sendbuf, int sendcount, MPI_Datatype sendtype,
 		char *recvbuf, int recvcount, MPI_Datatype recvtype, MPI_Comm comm);
 
 #endif /* SRC_GATA_H_ */

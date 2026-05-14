@@ -27,7 +27,7 @@ ATA_BENCH_SRC := \
 	benchmarks/OpenMPI_pairwise_ata.cpp \
 	benchmarks/MPICH_scattered_ata.cpp \
 	benchmarks/spreadout_ata.cpp \
-	benchmarks/rbruck_ata.cpp
+	benchmarks/bruck_ata.cpp
 ATA_BENCH_OBJ := $(patsubst benchmarks/%.cpp,$(BUILD_DIR)/%.o,$(ATA_BENCH_SRC))
 
 # Benchmark _atav sources (non-uniform alltoallv reference algorithms)

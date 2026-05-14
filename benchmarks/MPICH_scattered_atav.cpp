@@ -1,7 +1,5 @@
 /*
- * scattered.cpp
- *
- *  Created on: Feb 19, 2024
+ * MPICH_scattered_atav.cpp
  *      Author: kokofan
  */
 

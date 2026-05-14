@@ -1,7 +1,5 @@
 /*
- * OpenMPI_pairwise.cpp
- *
- *  Created on: Feb 20, 2024
+ * OpenMPI_pairwise_atav.cpp
  *      Author: kokofan
  */
 

@@ -1,7 +1,5 @@
 /*
- * OpenMPI_basic_linear.cpp
- *
- *  Created on: Feb 20, 2024
+ * OpenMPI_basic_linear_atav.cpp
  *      Author: kokofan
  */
 

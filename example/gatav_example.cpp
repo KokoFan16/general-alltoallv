@@ -159,6 +159,15 @@ static void run_gatav(int loopcount, int nprocs, std::vector<int> bases) {
 					MPI_COMM_WORLD);
 			});
 
+			// --- classic binary Bruck (r=2, no tuning) ---
+			bench("Bruck", n, nprocs, 0, 0,
+			      send_buffer, sendcounts, sdispls, recvcounts, recv_buffer, [&]{
+				basic_bruck_alltoallv(
+					(char*)send_buffer, sendcounts, sdispls, MPI_UNSIGNED_LONG_LONG,
+					(char*)recv_buffer, recvcounts, rdispls, MPI_UNSIGNED_LONG_LONG,
+					MPI_COMM_WORLD);
+			});
+
 			// --- XOR (only works when P is power of 2) ---
 			int w = (int)ceil(log((double)nprocs) / log(2.0));
 			if (nprocs == myPow(2, w)) {

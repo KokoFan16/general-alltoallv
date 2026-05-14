@@ -36,6 +36,9 @@ void spreadout_alltoallv(char *sendbuf, int *sendcounts, int *sdispls, MPI_Datat
 int exclisive_or_alltoallv(char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
 		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm);
 
+void basic_bruck_alltoallv(char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
+		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm);
+
 // benchmark reference algorithms (uniform alltoall)
 int ompi_alltoall_intra_basic_linear(char *sendbuf, int sendcount, MPI_Datatype sendtype,
 		char *recvbuf, int recvcount, MPI_Datatype recvtype, MPI_Comm comm);

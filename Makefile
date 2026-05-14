@@ -36,7 +36,6 @@ ATAV_BENCH_SRC := \
 	benchmarks/OpenMPI_pairwise_atav.cpp \
 	benchmarks/MPICH_scattered_atav.cpp \
 	benchmarks/spreadout_atav.cpp \
-	benchmarks/exclusive_or_atav.cpp \
 	benchmarks/bruck_atav.cpp
 ATAV_BENCH_OBJ := $(patsubst benchmarks/%.cpp,$(BUILD_DIR)/%.o,$(ATAV_BENCH_SRC))
 

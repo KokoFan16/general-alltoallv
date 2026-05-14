@@ -21,7 +21,6 @@ of the most common reference implementations used inside MPICH and OpenMPI.
 | Reference | `benchmarks/MPICH_scattered_{ata,atav}.cpp`      | MPICH scattered (with `b` batching) |
 | Reference | `benchmarks/spreadout_{ata,atav}.cpp`            | spread-out (rotated post order) |
 | Reference | `benchmarks/bruck_{ata,atav}.cpp`                | classic binary Bruck (r=2) |
-| Reference | `benchmarks/exclusive_or_atav.cpp`               | XOR-based (P must be power of 2) |
 
 Naming convention:
 
@@ -126,7 +125,6 @@ Every benchmarked call prints one line of CSV-friendly output:
 | `MPICH-scattered`  | `b`    | 0      | MPICH scattered (b sweep) |
 | `Spreadout`        | 0      | 0      | spread-out |
 | `Bruck`            | 0      | 0      | classic binary Bruck (r=2 hardcoded) |
-| `XOR` (atav only)  | 0      | 0      | XOR (only printed when P is power of 2) |
 | `gata`             | `b`    | `r`    | our uniform alltoall |
 | `gatav`            | `b`    | `r`    | our non-uniform alltoallv |
 

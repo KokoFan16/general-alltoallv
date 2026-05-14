@@ -33,9 +33,6 @@ int MPICH_intra_scattered(int b, char *sendbuf, int *sendcounts, int *sdispls, M
 void spreadout_alltoallv(char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
 		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm);
 
-int exclisive_or_alltoallv(char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
-		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm);
-
 void basic_bruck_alltoallv(char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
 		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm);
 

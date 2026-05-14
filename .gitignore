@@ -1,12 +1,9 @@
-# Build artifacts
+# Build directory (all objects + binaries)
+build/
+
+# Loose build artifacts (in case anyone builds without the Makefile)
 *.o
 *.dSYM/
-
-# Example binaries
-example/gatav_example
-example/gatav_gpu_example
-example/gata_example
-example/gata_gpu_example
 
 # OS junk
 .DS_Store

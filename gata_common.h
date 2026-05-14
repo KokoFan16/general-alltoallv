@@ -19,6 +19,14 @@
 #include <cmath>
 #include <vector>
 
+inline int myPow(int x, unsigned int p) {
+    if (p == 0) return 1;
+    if (p == 1) return x;
+    int tmp = myPow(x, p / 2);
+    if (p % 2 == 0) return tmp * tmp;
+    else return x * tmp * tmp;
+}
+
 inline int check_errors(int *recvcounts, long long *recv_buffer, int rank, int nprocs) {
     int error = 0, index = 0;
     for (int p = 0; p < nprocs; p++) {

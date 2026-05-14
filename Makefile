@@ -84,18 +84,28 @@ $(GATAGPU_OBJ): $(GATAGPU_SRC) $(HDRS) | $(BUILD_DIR)
 	$(NVCC) -ccbin $(MPICXX) $(NVCCFLAGS) -c $(GATAGPU_SRC) -o $@
 
 # --- examples --------------------------------------------------------------
+# After each binary is linked, remove its .o files and any .dSYM directory,
+# so build/ holds only the final binaries.
 
 $(GATAV_EX_BIN): $(GATAV_EX_SRC) $(GATAV_OBJ) $(ATAV_BENCH_OBJ) $(HDRS) | $(BUILD_DIR)
 	$(MPICXX) $(CXXFLAGS) $(GATAV_EX_SRC) $(GATAV_OBJ) $(ATAV_BENCH_OBJ) -o $@
+	@rm -f $(GATAV_OBJ) $(ATAV_BENCH_OBJ)
+	@rm -rf $@.dSYM
 
 $(GATA_EX_BIN): $(GATA_EX_SRC) $(GATA_OBJ) $(ATA_BENCH_OBJ) $(HDRS) | $(BUILD_DIR)
 	$(MPICXX) $(CXXFLAGS) $(GATA_EX_SRC) $(GATA_OBJ) $(ATA_BENCH_OBJ) -o $@
+	@rm -f $(GATA_OBJ) $(ATA_BENCH_OBJ)
+	@rm -rf $@.dSYM
 
 $(GATAVGPU_EX_BIN): $(GATAVGPU_EX_SRC) $(GATAV_OBJ) $(GATAVGPU_OBJ) $(HDRS) | $(BUILD_DIR)
 	$(NVCC) -ccbin $(MPICXX) $(NVCCFLAGS) $(GATAVGPU_EX_SRC) $(GATAV_OBJ) $(GATAVGPU_OBJ) -o $@
+	@rm -f $(GATAV_OBJ) $(GATAVGPU_OBJ)
+	@rm -rf $@.dSYM
 
 $(GATAGPU_EX_BIN): $(GATAGPU_EX_SRC) $(GATA_OBJ) $(GATAGPU_OBJ) $(HDRS) | $(BUILD_DIR)
 	$(NVCC) -ccbin $(MPICXX) $(NVCCFLAGS) $(GATAGPU_EX_SRC) $(GATA_OBJ) $(GATAGPU_OBJ) -o $@
+	@rm -f $(GATA_OBJ) $(GATAGPU_OBJ)
+	@rm -rf $@.dSYM
 
 clean:
 	rm -rf $(BUILD_DIR)

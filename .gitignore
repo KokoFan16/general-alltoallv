@@ -5,5 +5,10 @@ build/
 *.o
 *.dSYM/
 
+# Data and plot artifacts (don't track raw results / generated figures)
+data/
+plots/*.png
+plots/.ipynb_checkpoints/
+
 # OS junk
 .DS_Store

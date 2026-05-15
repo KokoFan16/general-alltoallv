@@ -191,3 +191,51 @@ The two `_gpu` examples need:
 If MPI isn't CUDA-aware you'll typically see a segfault inside MPI when it
 dereferences the device pointer. A staging-buffer fallback isn't shipped — let
 me know if you want one.
+
+## Platform notes
+
+### Polaris (ALCF)
+
+The default `PrgEnv-nvhpc` programming environment's `nvc++` (LLVM-based)
+crashes during `-O2` compilation of files with C-style variable-length
+arrays (VLAs), e.g.:
+
+```
+Intrinsic called with incompatible signature
+  call void @llvm.stackrestore.p0() ...
+LLVM ERROR: Broken module found, compilation aborted!
+```
+
+Fix — switch to the GNU programming environment before building:
+
+```bash
+module load PrgEnv-gnu
+make clean && make ata atav
+```
+
+**Large-scale runs (≥ 4096 ranks): fabric flow-control crash.**
+At high process counts the algorithms post thousands of concurrent
+non-blocking sends/recvs (worst case `2·(P−1)` when `b ≈ P−1` is swept),
+which overflows the CXI / Slingshot NIC's hardware match list. The job
+aborts with messages like:
+
+```
+libfabric:...::cxi:core:cxip_ux_onload_cb():2206<warn> ...
+  PtlTE NN:[Fatal] LE resources not recovered during flow control.
+  FI_CXI_RX_MATCH_MODE=[hybrid|software] is required
+```
+
+Fix — switch the CXI provider to hybrid match mode before launching:
+
+```bash
+export FI_CXI_RX_MATCH_MODE=hybrid
+# optional but recommended for 4k+ ranks:
+export FI_CXI_RDZV_PROTO=alt_read
+export FI_CXI_DEFAULT_CQ_SIZE=131072
+
+mpiexec -n 8192 ./build/gata_example ...
+```
+
+`hybrid` lets the NIC fall back to software matching when the hardware
+list is full; `software` forces software matching everywhere (safer but
+slower).

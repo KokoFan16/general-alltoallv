@@ -216,7 +216,6 @@ int tuna2_gpu_algorithm(int r, int b,
                               << stats[ii].MPI_ERROR << '\n';
                 }
             }
-            MPI_Barrier(comm);
         }
 
         if (K < nprocs - 1) {

@@ -41,18 +41,33 @@ int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sen
 
 	const size_t block_size = (size_t)sendcount * typesize;
 
+	// Scratch buffer cached across calls — grow on demand, never shrink.
+	// Layout: [extra | temp_recv | temp_send]. Leaks at process exit (intentional).
+	static thread_local char  *g_scratch     = nullptr;
+	static thread_local size_t g_scratch_cap = 0;
+
+	size_t extra_sz = block_size * (size_t)(nprocs - rem1);
+	size_t tsend_sz = block_size * (size_t)nprocs;
+	size_t trecv_sz = block_size * (size_t)nprocs;
+
 	if (K < nprocs - 1) {
 		// create local index array after rotation
 		for (i = 0; i < nprocs; i++) { rotate_index_array[i] = (2 * rank - i + nprocs) % nprocs; }
 
-		// allocate temp buffers (uniform sizes — no Allreduce for max needed)
-		extra_buffer     = (char*) malloc(block_size * (nprocs - rem1));
-		temp_recv_buffer = (char*) malloc(block_size * nprocs);
-		temp_send_buffer = (char*) malloc(block_size * nprocs);
-		if (extra_buffer == nullptr || temp_recv_buffer == nullptr || temp_send_buffer == nullptr) {
-			std::cerr << "buffer allocation failed!" << std::endl;
-			return 1;
+		size_t want = extra_sz + trecv_sz + tsend_sz;
+		if (g_scratch_cap < want) {
+			free(g_scratch);
+			g_scratch = (char*) malloc(want);
+			if (g_scratch == nullptr) {
+				g_scratch_cap = 0;
+				fprintf(stderr, "buffer allocation failed!\n");
+				return 1;
+			}
+			g_scratch_cap = want;
 		}
+		extra_buffer     = g_scratch;
+		temp_recv_buffer = g_scratch + extra_sz;
+		temp_send_buffer = g_scratch + extra_sz + trecv_sz;
 
 		for (int x = 0; x < w; x++) {
 			for (int z = 1; z < r; z ++) {
@@ -77,7 +92,7 @@ int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sen
 	MPI_Request* reqs  = (MPI_Request *) malloc(2 * r * sizeof(MPI_Request));
 	MPI_Status*  stats = (MPI_Status  *) malloc(2 * r * sizeof(MPI_Status));
 	if (reqs == nullptr || stats == nullptr) {
-		std::cerr << "MPI_Request/Status allocation failed!" << std::endl;
+		fprintf(stderr, "MPI_Request/Status allocation failed!\n");
 		return 1;
 	}
 
@@ -150,10 +165,9 @@ int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sen
 			MPI_Waitall(num_reqs, reqs, stats);
 			for (int i = 0; i < num_reqs; i++) {
 				if (stats[i].MPI_ERROR != MPI_SUCCESS) {
-					printf("Request %d encountered an error: %d\n", i, stats[i].MPI_ERROR);
+					fprintf(stderr, "Request %d encountered an error: %d\n", i, stats[i].MPI_ERROR);
 				}
 			}
-			MPI_Barrier(comm);
 		}
 
 		if (K < nprocs - 1) {
@@ -181,11 +195,7 @@ int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sen
 		next_distance *= r;
 	}
 
-	if (K < nprocs - 1) {
-		free(extra_buffer);
-		free(temp_recv_buffer);
-		free(temp_send_buffer);
-	}
+	// g_scratch is intentionally kept allocated across calls.
 	free(reqs);
 	free(stats);
 

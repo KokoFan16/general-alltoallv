@@ -30,10 +30,14 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 
 	int rem1 = K + 1, rem2 = r + 1;
 	int sendNcopy[nprocs - rem1];
-	char *extra_buffer, *temp_recv_buffer, *temp_send_buffer;
+	char *extra_buffer = nullptr, *temp_recv_buffer = nullptr, *temp_send_buffer = nullptr;
 	int extra_ids[nprocs - rem2];
 	memset(extra_ids, -1, sizeof(extra_ids));
 	int spoint = 1, distance = 1, next_distance = distance*r, di = 0;
+
+	// Scratch buffer cached across calls — grow on demand, never shrink.
+	static thread_local char  *g_scratch     = nullptr;
+	static thread_local size_t g_scratch_cap = 0;
 
 	if (K < nprocs - 1) {
 		// 1. Find max send count
@@ -45,18 +49,25 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 		// 2. create local index array after rotation
 		for (i = 0; i < nprocs; i++) { rotate_index_array[i] = (2 * rank - i + nprocs) % nprocs; }
 
-		// 3. exchange data with log(P) steps
-		extra_buffer = (char*) malloc(max_send_count * typesize * (nprocs - rem1));
-		temp_recv_buffer = (char*) malloc(max_send_count * nprocs * typesize);
-	    if (extra_buffer == nullptr || temp_recv_buffer == nullptr) {
-	        std::cerr << "extra_buffer or temp_recv_buffer allocation failed!" << std::endl;
-	        return 1; // Exit program with error
-	    }
-		temp_send_buffer = (char*) malloc(max_send_count * nprocs * typesize);
-	    if (temp_send_buffer == nullptr) {
-	        std::cerr << "temp_send_buffer allocation failed!" << std::endl;
-	        return 1; // Exit program with error
-	    }
+		// 3. cached scratch — layout: [extra | temp_recv | temp_send]
+		size_t unit     = (size_t)max_send_count * typesize;
+		size_t extra_sz = unit * (size_t)(nprocs - rem1);
+		size_t trecv_sz = unit * (size_t)nprocs;
+		size_t tsend_sz = unit * (size_t)nprocs;
+		size_t want     = extra_sz + trecv_sz + tsend_sz;
+		if (g_scratch_cap < want) {
+			free(g_scratch);
+			g_scratch = (char*) malloc(want);
+			if (g_scratch == nullptr) {
+				g_scratch_cap = 0;
+				fprintf(stderr, "buffer allocation failed!\n");
+				return 1;
+			}
+			g_scratch_cap = want;
+		}
+		extra_buffer     = g_scratch;
+		temp_recv_buffer = g_scratch + extra_sz;
+		temp_send_buffer = g_scratch + extra_sz + trecv_sz;
 
 		for (int x = 0; x < w; x++) {
 			for (int z = 1; z < r; z ++) {
@@ -81,18 +92,24 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 	spoint = 1, distance = 1, next_distance = distance*r;
 
 	MPI_Request* reqs = (MPI_Request *) malloc(2 * r * sizeof(MPI_Request));
-    if (reqs == nullptr) {
-        std::cerr << "MPI_Requests allocation failed!" << std::endl;
-        return 1; // Exit program with error
-    }
+	if (reqs == nullptr) {
+		fprintf(stderr, "MPI_Requests allocation failed!\n");
+		return 1;
+	}
 
-    MPI_Status* stats = (MPI_Status *) malloc(2 * r * sizeof(MPI_Status));
-    if (stats == nullptr) {
-        std::cerr << "MPI_Status allocation failed!" << std::endl;
-        return 1; // Exit program with error
-    }
+	MPI_Status* stats = (MPI_Status *) malloc(2 * r * sizeof(MPI_Status));
+	if (stats == nullptr) {
+		fprintf(stderr, "MPI_Status allocation failed!\n");
+		return 1;
+	}
 
-	int metadata_send[nlpow];
+	// metadata_send: per-z slot so multiple z's can be in flight concurrently
+	int metadata_send[r - 1][nlpow];
+	// extra scratch needed for the metadata-batching pass
+	MPI_Request md_reqs[2 * r];
+	int md_di    [r - 1];
+	int md_sendrk[r - 1];
+	int md_recvrk[r - 1];
 
     int comm_size[r-1];
 	for (int x = 0; x < w; x++) {
@@ -103,10 +120,11 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 		for (int k = 1; k < ze; k += b) {
 			ss = ze - k < b ? ze - k : b;
 			num_reqs = 0;
-			int send_zoffset = 0;
+			size_t send_zoffset = 0;
 
+			// ---- Phase A: post all metadata Isend/Irecv for this batch ----
+			int num_md = 0;
 			for (int s = 0; s < ss; s++) {
-
 				int z = k + s;
 
 				spoint = z * distance;
@@ -116,14 +134,19 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 				zns[z-1] = ns;
 
 				int recvrank = (rank + spoint) % nprocs;
-				int sendrank = (rank - spoint + nprocs) % nprocs; // send data from rank + 2^k process
-
+				int sendrank = (rank - spoint + nprocs) % nprocs;
+				md_sendrk[z-1] = sendrank;
+				md_recvrk[z-1] = recvrank;
 
 				if (ns == 1) {
-
-					MPI_Irecv(&recvbuf[rdispls[recvrank]*typesize], recvcounts[recvrank]*typesize, MPI_CHAR, recvrank, 1, comm, &reqs[num_reqs++]);
-
-					MPI_Isend(&sendbuf[sdispls[sendrank]*typesize], sendcounts[sendrank]*typesize, MPI_CHAR, sendrank, 1, comm, &reqs[num_reqs++]);
+					// direct exchange — no metadata round needed
+					md_di[z-1] = 0;
+					MPI_Irecv(&recvbuf[(size_t)rdispls[recvrank]*typesize],
+					          recvcounts[recvrank]*typesize, MPI_CHAR,
+					          recvrank, 1, comm, &reqs[num_reqs++]);
+					MPI_Isend(&sendbuf[(size_t)sdispls[sendrank]*typesize],
+					          sendcounts[sendrank]*typesize, MPI_CHAR,
+					          sendrank, 1, comm, &reqs[num_reqs++]);
 				}
 				else {
 					di = 0;
@@ -134,80 +157,94 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 							sent_blocks[z-1][di++] = id;
 						}
 					}
+					md_di[z-1] = di;
 
-					// 2) prepare metadata
-					int sendCount = 0, offset = 0;
 					for (int i = 0; i < di; i++) {
 						int send_index = rotate_index_array[sent_blocks[z-1][i]];
 						int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
-
-						if (i % distance == 0) {
-							metadata_send[i] = sendcounts[send_index];
-						}
-						else {
-							metadata_send[i] = sendNcopy[extra_ids[o]];
-						}
-						offset += metadata_send[i] * typesize;
+						metadata_send[z-1][i] = (i % distance == 0)
+						                        ? sendcounts[send_index]
+						                        : sendNcopy[extra_ids[o]];
 					}
 
-					MPI_Sendrecv(metadata_send, di, MPI_INT, sendrank, 0, metadata_recv[z-1], di,
-							MPI_INT, recvrank, 0, comm, MPI_STATUS_IGNORE);
+					// post metadata Isend/Irecv (non-blocking — overlap across s)
+					MPI_Irecv(metadata_recv[z-1], di, MPI_INT, recvrank, 0,
+					          comm, &md_reqs[num_md++]);
+					MPI_Isend(metadata_send[z-1], di, MPI_INT, sendrank, 0,
+					          comm, &md_reqs[num_md++]);
+				}
+			}
 
-					for(int i = 0; i < di; i++) { sendCount += metadata_recv[z-1][i]; }
-					comm_size[z-1] = sendCount; // total exchanged data per round
+			// wait for all metadata to arrive
+			if (num_md > 0) MPI_Waitall(num_md, md_reqs, MPI_STATUSES_IGNORE);
 
-					// prepare send data
-					offset = 0;
-					for (int i = 0; i < di; i++) {
-						int send_index = rotate_index_array[sent_blocks[z-1][i]];
-						int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
-						int size = 0;
+			// ---- Phase B: pack data, post data Isend/Irecv ----
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				int di_z = md_di[z-1];
+				if (di_z == 0) continue;   // already posted in Phase A (ns == 1)
 
-						if (i % distance == 0) {
-							size = sendcounts[send_index]*typesize;
-							memcpy(&temp_send_buffer[send_zoffset + offset], &sendbuf[sdispls[send_index]*typesize], size);
-						}
-						else {
-							size = sendNcopy[extra_ids[o]]*typesize;
-							memcpy(&temp_send_buffer[send_zoffset + offset], &extra_buffer[extra_ids[o]*max_send_count*typesize], size);
-						}
+				int sendrank = md_sendrk[z-1];
+				int recvrank = md_recvrk[z-1];
 
-						offset += size;
+				size_t sendCount = 0;
+				for (int i = 0; i < di_z; i++)
+					sendCount += (size_t)metadata_recv[z-1][i];
+				comm_size[z-1] = (int)sendCount;   // legacy int slot (kept for replace step)
+
+				size_t offset = 0;
+				for (int i = 0; i < di_z; i++) {
+					int send_index = rotate_index_array[sent_blocks[z-1][i]];
+					int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
+					size_t size;
+
+					if (i % distance == 0) {
+						size = (size_t)sendcounts[send_index] * typesize;
+						memcpy(&temp_send_buffer[send_zoffset + offset],
+						       &sendbuf[(size_t)sdispls[send_index] * typesize], size);
 					}
-
-					MPI_Irecv(&temp_recv_buffer[zoffset], comm_size[z-1]*typesize, MPI_CHAR, recvrank, recvrank+z, comm, &reqs[num_reqs++]);
-					MPI_Isend(&temp_send_buffer[send_zoffset], offset, MPI_CHAR, sendrank, rank+z, comm, &reqs[num_reqs++]);
-
-					zoffset += comm_size[z-1]*typesize;
-					send_zoffset += offset;
+					else {
+						size = (size_t)sendNcopy[extra_ids[o]] * typesize;
+						memcpy(&temp_send_buffer[send_zoffset + offset],
+						       &extra_buffer[(size_t)extra_ids[o] * max_send_count * typesize], size);
+					}
+					offset += size;
 				}
 
+				size_t recv_bytes = sendCount * typesize;
+				MPI_Irecv(&temp_recv_buffer[zoffset], (int)recv_bytes, MPI_CHAR,
+				          recvrank, recvrank+z, comm, &reqs[num_reqs++]);
+				MPI_Isend(&temp_send_buffer[send_zoffset], (int)offset, MPI_CHAR,
+				          sendrank, rank+z, comm, &reqs[num_reqs++]);
+
+				zoffset      += recv_bytes;
+				send_zoffset += offset;
 			}
 
 			MPI_Waitall(num_reqs, reqs, stats);
 			for (int i = 0; i < num_reqs; i++) {
-			    if (stats[i].MPI_ERROR != MPI_SUCCESS) {
-			        printf("Request %d encountered an error: %d\n", i, stats[i].MPI_ERROR);
-			    }
+				if (stats[i].MPI_ERROR != MPI_SUCCESS) {
+					fprintf(stderr, "Request %d encountered an error: %d\n", i, stats[i].MPI_ERROR);
+				}
 			}
-			MPI_Barrier(MPI_COMM_WORLD);
 		}
 
 		if (K < nprocs - 1) {
 			// replaces
-			int offset = 0;
+			size_t offset = 0;
 			for (int i = 0; i < zc; i++) {
-				for (int j = 0; j < zns[i]; j++){
-
-					if (zns[i] > 1){
-						int size = metadata_recv[i][j]*typesize;
+				for (int j = 0; j < zns[i]; j++) {
+					if (zns[i] > 1) {
+						size_t size = (size_t)metadata_recv[i][j] * typesize;
 						int o = (sent_blocks[i][j] - rank + nprocs) % nprocs - rem2;
 
 						if (j < distance) {
-							memcpy(&recvbuf[rdispls[sent_blocks[i][j]]*typesize], &temp_recv_buffer[offset], size);
+							memcpy(&recvbuf[(size_t)rdispls[sent_blocks[i][j]] * typesize],
+							       &temp_recv_buffer[offset], size);
 						}
 						else {
-							memcpy(&extra_buffer[extra_ids[o]*max_send_count*typesize], &temp_recv_buffer[offset], size);
+							memcpy(&extra_buffer[(size_t)extra_ids[o] * max_send_count * typesize],
+							       &temp_recv_buffer[offset], size);
 							sendNcopy[extra_ids[o]] = metadata_recv[i][j];
 						}
 						offset += size;
@@ -218,13 +255,9 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 
 		distance *= r;
 		next_distance *= r;
+	}
 
-	}
-	if (K < nprocs - 1) {
-		free(extra_buffer);
-		free(temp_recv_buffer);
-		free(temp_send_buffer);
-	}
+	// g_scratch is intentionally kept allocated across calls.
 	free(reqs);
 	free(stats);
 

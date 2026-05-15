@@ -81,11 +81,13 @@ static void run_gatav(int loopcount, int nprocs, std::vector<int> bases) {
 		int sdispls[nprocs];
 		int soffset = 0;
 
-		for (int i = 0; i < nprocs; i++) sendcounts[i] = n;
-
-		// shuffle sendcounts so each rank can have a different pattern
-		unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-		std::shuffle(&sendcounts[0], &sendcounts[nprocs], std::default_random_engine(seed));
+		// Uniform-random non-uniform distribution: each rank picks its own
+		// (deterministic from rank + n), peer counts ∈ [0, n].
+		// n is the MAX per-peer count; average count is n/2 so the total
+		// volume is ~half of the uniform-`n` case.
+		std::mt19937 rng((unsigned)(rank * 1000003u + (unsigned)n));
+		std::uniform_int_distribution<int> dist(0, n);
+		for (int i = 0; i < nprocs; i++) sendcounts[i] = dist(rng);
 
 		for (int i = 0; i < nprocs; i++) {
 			sdispls[i] = soffset;

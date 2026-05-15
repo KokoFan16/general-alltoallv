@@ -8,6 +8,7 @@ build/
 # Data and plot artifacts (don't track raw results / generated figures)
 data/
 plots/*.png
+plots/*.txt
 plots/.ipynb_checkpoints/
 
 # OS junk

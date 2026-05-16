@@ -106,59 +106,79 @@ int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sen
 			num_reqs = 0;
 			size_t send_zoffset = 0;
 
+			// Per-s state captured in sub-phase 0, reused in sub-phases 1 & 2.
+			int    s_ns[ss], s_sendrk[ss], s_recvrk[ss];
+			size_t s_send_off[ss], s_recv_off[ss], s_bytes[ss];
+
+			// ---- Sub-phase 0: compute, build sent_blocks, pack send data ----
 			for (int s = 0; s < ss; s++) {
-
 				int z = k + s;
-
 				spoint = z * distance;
-				nc = nprocs / next_distance * distance, rem = nprocs % next_distance - spoint;
-				if (rem < 0) { rem = 0; }
+				nc = nprocs / next_distance * distance;
+				rem = nprocs % next_distance - spoint;
+				if (rem < 0) rem = 0;
 				ns = (rem > distance)? (nc + distance) : (nc + rem);
 				zns[z-1] = ns;
 
-				int recvrank = (rank + spoint) % nprocs;
-				int sendrank = (rank - spoint + nprocs) % nprocs;
+				s_ns[s]     = ns;
+				s_recvrk[s] = (rank + spoint) % nprocs;
+				s_sendrk[s] = (rank - spoint + nprocs) % nprocs;
 
-				if (ns == 1) {
-					MPI_Irecv(&recvbuf[recvrank * block_size], block_size, MPI_CHAR,
-							  recvrank, 1, comm, &reqs[num_reqs++]);
-					MPI_Isend(&sendbuf[sendrank * block_size], block_size, MPI_CHAR,
-							  sendrank, 1, comm, &reqs[num_reqs++]);
+				if (ns == 1) continue;
+
+				di = 0;
+				for (int i = spoint; i < nprocs; i += next_distance) {
+					int j_end = (i+distance > nprocs)? nprocs: i+distance;
+					for (int j = i; j < j_end; j++) {
+						int id = (j + rank) % nprocs;
+						sent_blocks[z-1][di++] = id;
+					}
 				}
-				else {
-					di = 0;
-					for (int i = spoint; i < nprocs; i += next_distance) {
-						int j_end = (i+distance > nprocs)? nprocs: i+distance;
-						for (int j = i; j < j_end; j++) {
-							int id = (j + rank) % nprocs;
-							sent_blocks[z-1][di++] = id;
-						}
+
+				for (int i = 0; i < di; i++) {
+					int send_index = rotate_index_array[sent_blocks[z-1][i]];
+					int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
+					size_t pos = send_zoffset + (size_t)i * block_size;
+					if (i % distance == 0) {
+						memcpy(&temp_send_buffer[pos],
+						       &sendbuf[send_index * block_size], block_size);
+					} else {
+						memcpy(&temp_send_buffer[pos],
+						       &extra_buffer[(size_t)extra_ids[o] * block_size], block_size);
 					}
+				}
 
-					// prepare send data (block sizes are all uniform; no metadata exchange)
-					for (int i = 0; i < di; i++) {
-						int send_index = rotate_index_array[sent_blocks[z-1][i]];
-						int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
-						size_t pos = send_zoffset + (size_t)i * block_size;
+				size_t total    = (size_t)di * block_size;
+				s_send_off[s]   = send_zoffset;
+				s_recv_off[s]   = zoffset;
+				s_bytes[s]      = total;
+				zoffset        += total;
+				send_zoffset   += total;
+			}
 
-						if (i % distance == 0) {
-							memcpy(&temp_send_buffer[pos],
-								   &sendbuf[send_index * block_size], block_size);
-						}
-						else {
-							memcpy(&temp_send_buffer[pos],
-								   &extra_buffer[(size_t)extra_ids[o] * block_size], block_size);
-						}
-					}
+			// ---- Sub-phase 1: post ALL Irecvs first ----
+			// CXI / Slingshot match list works better when recv buffers are
+			// pre-posted before any send arrives.
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				if (s_ns[s] == 1) {
+					MPI_Irecv(&recvbuf[s_recvrk[s] * block_size], block_size, MPI_CHAR,
+					          s_recvrk[s], 1, comm, &reqs[num_reqs++]);
+				} else {
+					MPI_Irecv(&temp_recv_buffer[s_recv_off[s]], s_bytes[s], MPI_CHAR,
+					          s_recvrk[s], s_recvrk[s]+z, comm, &reqs[num_reqs++]);
+				}
+			}
 
-					size_t total = (size_t)di * block_size;
-					MPI_Irecv(&temp_recv_buffer[zoffset], total, MPI_CHAR,
-							  recvrank, recvrank+z, comm, &reqs[num_reqs++]);
-					MPI_Isend(&temp_send_buffer[send_zoffset], total, MPI_CHAR,
-							  sendrank, rank+z, comm, &reqs[num_reqs++]);
-
-					zoffset      += total;
-					send_zoffset += total;
+			// ---- Sub-phase 2: post ALL Isends ----
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				if (s_ns[s] == 1) {
+					MPI_Isend(&sendbuf[s_sendrk[s] * block_size], block_size, MPI_CHAR,
+					          s_sendrk[s], 1, comm, &reqs[num_reqs++]);
+				} else {
+					MPI_Isend(&temp_send_buffer[s_send_off[s]], s_bytes[s], MPI_CHAR,
+					          s_sendrk[s], rank+z, comm, &reqs[num_reqs++]);
 				}
 			}
 

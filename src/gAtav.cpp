@@ -121,34 +121,25 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 			ss = ze - k < b ? ze - k : b;
 			num_reqs = 0;
 			size_t send_zoffset = 0;
-
-			// ---- Phase A: post all metadata Isend/Irecv for this batch ----
 			int num_md = 0;
+
+			// ---- Phase A0: compute, build sent_blocks, build metadata_send ----
 			for (int s = 0; s < ss; s++) {
 				int z = k + s;
 
 				spoint = z * distance;
-				nc = nprocs / next_distance * distance, rem = nprocs % next_distance - spoint;
-				if (rem < 0) { rem = 0; }
+				nc = nprocs / next_distance * distance;
+				rem = nprocs % next_distance - spoint;
+				if (rem < 0) rem = 0;
 				ns = (rem > distance)? (nc + distance) : (nc + rem);
 				zns[z-1] = ns;
 
-				int recvrank = (rank + spoint) % nprocs;
-				int sendrank = (rank - spoint + nprocs) % nprocs;
-				md_sendrk[z-1] = sendrank;
-				md_recvrk[z-1] = recvrank;
+				md_recvrk[z-1] = (rank + spoint) % nprocs;
+				md_sendrk[z-1] = (rank - spoint + nprocs) % nprocs;
 
 				if (ns == 1) {
-					// direct exchange — no metadata round needed
-					md_di[z-1] = 0;
-					MPI_Irecv(&recvbuf[(size_t)rdispls[recvrank]*typesize],
-					          recvcounts[recvrank]*typesize, MPI_CHAR,
-					          recvrank, 1, comm, &reqs[num_reqs++]);
-					MPI_Isend(&sendbuf[(size_t)sdispls[sendrank]*typesize],
-					          sendcounts[sendrank]*typesize, MPI_CHAR,
-					          sendrank, 1, comm, &reqs[num_reqs++]);
-				}
-				else {
+					md_di[z-1] = 0;   // direct exchange, no metadata
+				} else {
 					di = 0;
 					for (int i = spoint; i < nprocs; i += next_distance) {
 						int j_end = (i+distance > nprocs)? nprocs: i+distance;
@@ -166,31 +157,48 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 						                        ? sendcounts[send_index]
 						                        : sendNcopy[extra_ids[o]];
 					}
-
-					// post metadata Isend/Irecv (non-blocking — overlap across s)
-					MPI_Irecv(metadata_recv[z-1], di, MPI_INT, recvrank, 0,
-					          comm, &md_reqs[num_md++]);
-					MPI_Isend(metadata_send[z-1], di, MPI_INT, sendrank, 0,
-					          comm, &md_reqs[num_md++]);
 				}
 			}
 
-			// wait for all metadata to arrive
+			// ---- Phase A1: post ALL Irecvs (ns==1 data + ns>1 metadata) ----
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				if (md_di[z-1] == 0) {
+					MPI_Irecv(&recvbuf[(size_t)rdispls[md_recvrk[z-1]]*typesize],
+					          recvcounts[md_recvrk[z-1]]*typesize, MPI_CHAR,
+					          md_recvrk[z-1], 1, comm, &reqs[num_reqs++]);
+				} else {
+					MPI_Irecv(metadata_recv[z-1], md_di[z-1], MPI_INT,
+					          md_recvrk[z-1], 0, comm, &md_reqs[num_md++]);
+				}
+			}
+
+			// ---- Phase A2: post ALL Isends (ns==1 data + ns>1 metadata) ----
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				if (md_di[z-1] == 0) {
+					MPI_Isend(&sendbuf[(size_t)sdispls[md_sendrk[z-1]]*typesize],
+					          sendcounts[md_sendrk[z-1]]*typesize, MPI_CHAR,
+					          md_sendrk[z-1], 1, comm, &reqs[num_reqs++]);
+				} else {
+					MPI_Isend(metadata_send[z-1], md_di[z-1], MPI_INT,
+					          md_sendrk[z-1], 0, comm, &md_reqs[num_md++]);
+				}
+			}
+
 			if (num_md > 0) MPI_Waitall(num_md, md_reqs, MPI_STATUSES_IGNORE);
 
-			// ---- Phase B: pack data, post data Isend/Irecv ----
+			// ---- Phase B0: pack data using metadata_recv ----
+			size_t s_send_off[ss], s_recv_off[ss], s_send_bytes[ss], s_recv_bytes[ss];
 			for (int s = 0; s < ss; s++) {
 				int z = k + s;
 				int di_z = md_di[z-1];
-				if (di_z == 0) continue;   // already posted in Phase A (ns == 1)
-
-				int sendrank = md_sendrk[z-1];
-				int recvrank = md_recvrk[z-1];
+				if (di_z == 0) continue;
 
 				size_t sendCount = 0;
 				for (int i = 0; i < di_z; i++)
 					sendCount += (size_t)metadata_recv[z-1][i];
-				comm_size[z-1] = (int)sendCount;   // legacy int slot (kept for replace step)
+				comm_size[z-1] = (int)sendCount;
 
 				size_t offset = 0;
 				for (int i = 0; i < di_z; i++) {
@@ -202,8 +210,7 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 						size = (size_t)sendcounts[send_index] * typesize;
 						memcpy(&temp_send_buffer[send_zoffset + offset],
 						       &sendbuf[(size_t)sdispls[send_index] * typesize], size);
-					}
-					else {
+					} else {
 						size = (size_t)sendNcopy[extra_ids[o]] * typesize;
 						memcpy(&temp_send_buffer[send_zoffset + offset],
 						       &extra_buffer[(size_t)extra_ids[o] * max_send_count * typesize], size);
@@ -212,13 +219,28 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 				}
 
 				size_t recv_bytes = sendCount * typesize;
-				MPI_Irecv(&temp_recv_buffer[zoffset], (int)recv_bytes, MPI_CHAR,
-				          recvrank, recvrank+z, comm, &reqs[num_reqs++]);
-				MPI_Isend(&temp_send_buffer[send_zoffset], (int)offset, MPI_CHAR,
-				          sendrank, rank+z, comm, &reqs[num_reqs++]);
+				s_send_off[s]    = send_zoffset;
+				s_recv_off[s]    = zoffset;
+				s_send_bytes[s]  = offset;
+				s_recv_bytes[s]  = recv_bytes;
+				zoffset         += recv_bytes;
+				send_zoffset    += offset;
+			}
 
-				zoffset      += recv_bytes;
-				send_zoffset += offset;
+			// ---- Phase B1: post ALL data Irecvs (ns>1 only) ----
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				if (md_di[z-1] == 0) continue;
+				MPI_Irecv(&temp_recv_buffer[s_recv_off[s]], (int)s_recv_bytes[s], MPI_CHAR,
+				          md_recvrk[z-1], md_recvrk[z-1]+z, comm, &reqs[num_reqs++]);
+			}
+
+			// ---- Phase B2: post ALL data Isends (ns>1 only) ----
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				if (md_di[z-1] == 0) continue;
+				MPI_Isend(&temp_send_buffer[s_send_off[s]], (int)s_send_bytes[s], MPI_CHAR,
+				          md_sendrk[z-1], rank+z, comm, &reqs[num_reqs++]);
 			}
 
 			MPI_Waitall(num_reqs, reqs, stats);

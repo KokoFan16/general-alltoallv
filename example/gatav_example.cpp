@@ -75,7 +75,7 @@ static void bench(const char *tag, int n, int nprocs, int extra1, int extra2,
 
 static void run_gatav(int loopcount, int nprocs, std::vector<int> bases) {
 
-	for (int n = 2048; n <= 8192; n = n * 2) {
+	for (int n = 2; n <= 8192; n = n * 2) {
 
 		int sendcounts[nprocs];
 		int sdispls[nprocs];

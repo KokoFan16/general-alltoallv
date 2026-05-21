@@ -1,10 +1,18 @@
 /*
  * gAta.cpp
  *
- * Uniform alltoall: every process sends `sendcount` elements to each other
- * process and receives `recvcount` elements from each other process. Derived
- * from gAtav.cpp by removing the per-pair count/displacement bookkeeping and
- * the metadata exchange round (sizes are already known to both sides).
+ * Uniform alltoall under the (r, b) parameter family:
+ *   r — Bruck radix
+ *   b — in-flight batch size (max concurrent z-steps per Waitall)
+ *
+ * Implementation: classical Bruck buffer layout (in-place `tmp`) generalised
+ * to radix r and in-flight batch size b. The pre-rotation moves sendbuf
+ * into a single rotated buffer `tmp`; all forwarded blocks live in `tmp`
+ * at fixed positions across rounds. Each sub-batch packs the active
+ * positions into a contiguous send-staging buffer, exchanges with the
+ * peers, and unpacks the received bytes back to the same positions in
+ * `tmp`. A final post-rotation copies `tmp` into recvbuf indexed by
+ * source rank.
  *
  *      Author: kokofan
  */
@@ -14,210 +22,187 @@
 int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sendtype,
 		char *recvbuf, int recvcount, MPI_Datatype recvtype, MPI_Comm comm) {
 
-	if ( r < 2 ) { r = 2; }
-
 	int rank, nprocs, typesize;
 	MPI_Comm_rank(comm, &rank);
 	MPI_Comm_size(comm, &nprocs);
 	MPI_Type_size(sendtype, &typesize);
 
-	if ( r > nprocs - 1 ) { r = nprocs - 1; }
+	const size_t block_size = (size_t)sendcount * typesize;
+	const size_t buf_bytes  = block_size * (size_t)nprocs;
+
+	// ---- Degenerate case: single process -------------------------------
+	if (nprocs <= 1) {
+		if (nprocs == 1 && block_size > 0)
+			memcpy(recvbuf, sendbuf, block_size);
+		return 0;
+	}
+
+	// ---- Parameter sanitisation ----------------------------------------
+	if (r < 2)             r = 2;
+	if (r > nprocs)        r = nprocs;     // r = P is valid (pairwise / linear)
 	if (b <= 0 || b > nprocs) b = nprocs;
 
-	int w, max_rank, nlpow, d, K, i, num_reqs;
-	int rotate_index_array[nprocs];
-	w = 0, nlpow = 1, max_rank = nprocs - 1;
-
+	// ---- Algorithm metadata --------------------------------------------
+	// w      = number of base-r digits needed for indices 0..nprocs-1
+	// nlpow  = r^(w-1), place value of the top digit
+	// d      = top-digit deficit when P is not a perfect power of r
+	int w = 0, max_rank = nprocs - 1, nlpow = 1;
 	while (max_rank) { w++; max_rank /= r; }
-	for (i = 0; i < w - 1; i++) { nlpow *= r; }
-	d = (nlpow*r - nprocs) / nlpow;
-	K = w * (r - 1) - d;
+	for (int i = 0; i < w - 1; i++) nlpow *= r;
+	int d = (nlpow * r - nprocs) / nlpow;
 
-	int rem1 = K + 1, rem2 = r + 1;
-	char *extra_buffer = nullptr, *temp_recv_buffer = nullptr, *temp_send_buffer = nullptr;
-	int extra_ids[nprocs - rem2];
-	memset(extra_ids, -1, sizeof(extra_ids));
-	int spoint = 1, distance = 1, next_distance = distance*r, di = 0;
-
-	const size_t block_size = (size_t)sendcount * typesize;
-
-	// Scratch buffer cached across calls — grow on demand, never shrink.
-	// Layout: [extra | temp_recv | temp_send]. Leaks at process exit (intentional).
+	// ---- Scratch buffer ------------------------------------------------
+	// Layout:  [ tmp | temp_send | temp_recv ], each P * block_size.
+	// Cached across calls (grow-only, intentionally leaked at exit).
 	static thread_local char  *g_scratch     = nullptr;
 	static thread_local size_t g_scratch_cap = 0;
 
-	size_t extra_sz = block_size * (size_t)(nprocs - rem1);
-	size_t tsend_sz = block_size * (size_t)nprocs;
-	size_t trecv_sz = block_size * (size_t)nprocs;
-
-	if (K < nprocs - 1) {
-		// create local index array after rotation
-		for (i = 0; i < nprocs; i++) { rotate_index_array[i] = (2 * rank - i + nprocs) % nprocs; }
-
-		size_t want = extra_sz + trecv_sz + tsend_sz;
-		if (g_scratch_cap < want) {
-			free(g_scratch);
-			g_scratch = (char*) malloc(want);
-			if (g_scratch == nullptr) {
-				g_scratch_cap = 0;
-				fprintf(stderr, "buffer allocation failed!\n");
-				return 1;
-			}
-			g_scratch_cap = want;
+	size_t want = buf_bytes * 3;
+	if (g_scratch_cap < want) {
+		free(g_scratch);
+		g_scratch = (char *) malloc(want);
+		if (g_scratch == nullptr) {
+			g_scratch_cap = 0;
+			fprintf(stderr, "gata: scratch allocation of %zu bytes failed\n", want);
+			return 1;
 		}
-		extra_buffer     = g_scratch;
-		temp_recv_buffer = g_scratch + extra_sz;
-		temp_send_buffer = g_scratch + extra_sz + trecv_sz;
+		g_scratch_cap = want;
+	}
+	char *tmp       = g_scratch;
+	char *temp_send = g_scratch + buf_bytes;
+	char *temp_recv = g_scratch + buf_bytes * 2;
 
-		for (int x = 0; x < w; x++) {
-			for (int z = 1; z < r; z ++) {
-				spoint = z * distance;
-				if (spoint > nprocs) { break; }
-				int end = (spoint + distance > nprocs)? nprocs : spoint + distance;
-				for (i = spoint + 1; i < end; i++) {
-					extra_ids[i-rem2] = di++;
-				}
-			}
-			distance *= r;
-		}
+	// ---- Pre-rotation:  tmp[i] = sendbuf[(i + rank) % P] ---------------
+	// Position i in tmp now holds rank's data destined for (i+rank)%P.
+	// Position 0 is the self block; it is never touched by any z-step
+	// (digit-x of 0 is 0 for every x), so the self-block is delivered
+	// automatically by the post-rotation.
+	for (int i = 0; i < nprocs; i++) {
+		memcpy(tmp + (size_t)i * block_size,
+		       sendbuf + (size_t)((i + rank) % nprocs) * block_size,
+		       block_size);
 	}
 
-	// copy data destined for self
-	memcpy(&recvbuf[rank * block_size], &sendbuf[rank * block_size], block_size);
-
-	int sent_blocks[r-1][nlpow];
-	int nc, rem, ns, ze, ss;
-	spoint = 1, distance = 1, next_distance = distance*r;
-
-	MPI_Request* reqs  = (MPI_Request *) malloc(2 * r * sizeof(MPI_Request));
-	MPI_Status*  stats = (MPI_Status  *) malloc(2 * r * sizeof(MPI_Status));
+	// ---- MPI request scratch -------------------------------------------
+	// At most 2(r-1) in flight per sub-batch (one Irecv + one Isend per z).
+	int max_reqs = 2 * r;
+	MPI_Request *reqs  = (MPI_Request *) malloc(max_reqs * sizeof(MPI_Request));
+	MPI_Status  *stats = (MPI_Status  *) malloc(max_reqs * sizeof(MPI_Status));
 	if (reqs == nullptr || stats == nullptr) {
-		fprintf(stderr, "MPI_Request/Status allocation failed!\n");
+		fprintf(stderr, "gata: MPI request allocation failed\n");
+		free(reqs); free(stats);
 		return 1;
 	}
 
+	// ---- Main loop:  w rounds, ceil((r-1)/b) sub-batches each ----------
+	int distance = 1;
 	for (int x = 0; x < w; x++) {
-		ze = (x == w - 1)? r - d: r;
-		int zoffset = 0, zc = ze-1;
-		int zns[zc];
+		int next_distance = distance * r;
+		int ze = (x == w - 1) ? r - d : r;   // last-round deficit
 
 		for (int k = 1; k < ze; k += b) {
-			ss = ze - k < b ? ze - k : b;
-			num_reqs = 0;
+			int ss = (ze - k < b) ? (ze - k) : b;
+
+			// Per-z bookkeeping kept around for sub-phases 1/2/3.
+			int    s_send_peer[ss], s_recv_peer[ss];
+			size_t s_off[ss];   // start of this z's region in temp_send/temp_recv
+			size_t s_bytes[ss]; // number of bytes for this z
+
+			// ---- Sub-phase 0: enumerate positions and pack -------------
+			// For z-step z in round x, the active positions are exactly
+			// those whose base-r digit at place x equals z, i.e.
+			//   p in [z*distance, z*distance + distance) ∪
+			//        [z*distance +  next_distance, ...) ∪ ...
+			// clipped to [0, nprocs).  We pack tmp[p] into a contiguous
+			// region of temp_send in enumeration order.
 			size_t send_zoffset = 0;
-
-			// Per-s state captured in sub-phase 0, reused in sub-phases 1 & 2.
-			int    s_ns[ss], s_sendrk[ss], s_recvrk[ss];
-			size_t s_send_off[ss], s_recv_off[ss], s_bytes[ss];
-
-			// ---- Sub-phase 0: compute, build sent_blocks, pack send data ----
 			for (int s = 0; s < ss; s++) {
 				int z = k + s;
-				spoint = z * distance;
-				nc = nprocs / next_distance * distance;
-				rem = nprocs % next_distance - spoint;
-				if (rem < 0) rem = 0;
-				ns = (rem > distance)? (nc + distance) : (nc + rem);
-				zns[z-1] = ns;
+				int spoint = z * distance;
 
-				s_ns[s]     = ns;
-				s_recvrk[s] = (rank + spoint) % nprocs;
-				s_sendrk[s] = (rank - spoint + nprocs) % nprocs;
+				s_send_peer[s] = (rank + spoint) % nprocs;
+				s_recv_peer[s] = (rank - spoint + nprocs) % nprocs;
+				s_off[s]       = send_zoffset;
 
-				if (ns == 1) continue;
-
-				di = 0;
+				int np = 0;
 				for (int i = spoint; i < nprocs; i += next_distance) {
-					int j_end = (i+distance > nprocs)? nprocs: i+distance;
+					int j_end = (i + distance < nprocs) ? (i + distance) : nprocs;
 					for (int j = i; j < j_end; j++) {
-						int id = (j + rank) % nprocs;
-						sent_blocks[z-1][di++] = id;
+						memcpy(temp_send + send_zoffset + (size_t)np * block_size,
+						       tmp + (size_t)j * block_size,
+						       block_size);
+						np++;
 					}
 				}
-
-				for (int i = 0; i < di; i++) {
-					int send_index = rotate_index_array[sent_blocks[z-1][i]];
-					int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
-					size_t pos = send_zoffset + (size_t)i * block_size;
-					if (i % distance == 0) {
-						memcpy(&temp_send_buffer[pos],
-						       &sendbuf[send_index * block_size], block_size);
-					} else {
-						memcpy(&temp_send_buffer[pos],
-						       &extra_buffer[(size_t)extra_ids[o] * block_size], block_size);
-					}
-				}
-
-				size_t total    = (size_t)di * block_size;
-				s_send_off[s]   = send_zoffset;
-				s_recv_off[s]   = zoffset;
-				s_bytes[s]      = total;
-				zoffset        += total;
-				send_zoffset   += total;
+				s_bytes[s]    = (size_t)np * block_size;
+				send_zoffset += s_bytes[s];
 			}
 
-			// ---- Sub-phase 1: post ALL Irecvs first ----
-			// CXI / Slingshot match list works better when recv buffers are
-			// pre-posted before any send arrives.
+			// ---- Sub-phase 1: post ALL Irecv first ---------------------
+			// On CXI / Slingshot the hardware match list works best when
+			// receive buffers are pre-posted before any send arrives.
+			int num_reqs = 0;
 			for (int s = 0; s < ss; s++) {
+				if (s_bytes[s] == 0) continue;
 				int z = k + s;
-				if (s_ns[s] == 1) {
-					MPI_Irecv(&recvbuf[s_recvrk[s] * block_size], block_size, MPI_CHAR,
-					          s_recvrk[s], 1, comm, &reqs[num_reqs++]);
-				} else {
-					MPI_Irecv(&temp_recv_buffer[s_recv_off[s]], s_bytes[s], MPI_CHAR,
-					          s_recvrk[s], s_recvrk[s]+z, comm, &reqs[num_reqs++]);
-				}
+				MPI_Irecv(temp_recv + s_off[s], s_bytes[s], MPI_CHAR,
+				          s_recv_peer[s], s_recv_peer[s] + z, comm,
+				          &reqs[num_reqs++]);
 			}
-
-			// ---- Sub-phase 2: post ALL Isends ----
+			// ---- Sub-phase 2: post ALL Isend ---------------------------
 			for (int s = 0; s < ss; s++) {
+				if (s_bytes[s] == 0) continue;
 				int z = k + s;
-				if (s_ns[s] == 1) {
-					MPI_Isend(&sendbuf[s_sendrk[s] * block_size], block_size, MPI_CHAR,
-					          s_sendrk[s], 1, comm, &reqs[num_reqs++]);
-				} else {
-					MPI_Isend(&temp_send_buffer[s_send_off[s]], s_bytes[s], MPI_CHAR,
-					          s_sendrk[s], rank+z, comm, &reqs[num_reqs++]);
-				}
+				MPI_Isend(temp_send + s_off[s], s_bytes[s], MPI_CHAR,
+				          s_send_peer[s], rank + z, comm,
+				          &reqs[num_reqs++]);
 			}
 
 			MPI_Waitall(num_reqs, reqs, stats);
 			for (int i = 0; i < num_reqs; i++) {
 				if (stats[i].MPI_ERROR != MPI_SUCCESS) {
-					fprintf(stderr, "Request %d encountered an error: %d\n", i, stats[i].MPI_ERROR);
+					fprintf(stderr, "gata: request %d error %d\n", i, stats[i].MPI_ERROR);
 				}
 			}
-		}
 
-		if (K < nprocs - 1) {
-			// place received blocks into final or extra slots
-			size_t offset = 0;
-			for (int i = 0; i < zc; i++) {
-				for (int j = 0; j < zns[i]; j++) {
-					if (zns[i] > 1) {
-						int o = (sent_blocks[i][j] - rank + nprocs) % nprocs - rem2;
-						if (j < distance) {
-							memcpy(&recvbuf[sent_blocks[i][j] * block_size],
-								   &temp_recv_buffer[offset], block_size);
-						}
-						else {
-							memcpy(&extra_buffer[(size_t)extra_ids[o] * block_size],
-								   &temp_recv_buffer[offset], block_size);
-						}
-						offset += block_size;
+			// ---- Sub-phase 3: unpack temp_recv back into tmp -----------
+			// Re-enumerate the same position list and write received
+			// blocks to the same tmp positions.  Forwarded blocks now
+			// sit at their next-round position; final-destination blocks
+			// will be picked up by post-rotation.
+			for (int s = 0; s < ss; s++) {
+				if (s_bytes[s] == 0) continue;
+				int z = k + s;
+				int spoint = z * distance;
+
+				size_t off = s_off[s];
+				int np = 0;
+				for (int i = spoint; i < nprocs; i += next_distance) {
+					int j_end = (i + distance < nprocs) ? (i + distance) : nprocs;
+					for (int j = i; j < j_end; j++) {
+						memcpy(tmp + (size_t)j * block_size,
+						       temp_recv + off + (size_t)np * block_size,
+						       block_size);
+						np++;
 					}
 				}
 			}
 		}
 
-		distance *= r;
-		next_distance *= r;
+		distance = next_distance;
 	}
 
-	// g_scratch is intentionally kept allocated across calls.
+	// ---- Post-rotation:  recvbuf[(rank - i + P) % P] = tmp[i] ----------
+	// After all rounds, tmp[i] at rank R holds data from source (R-i)%P
+	// (all destined for R).  Inverse rotation places it at recvbuf
+	// indexed by source rank.
+	for (int i = 0; i < nprocs; i++) {
+		memcpy(recvbuf + (size_t)((rank - i + nprocs) % nprocs) * block_size,
+		       tmp + (size_t)i * block_size,
+		       block_size);
+	}
+
 	free(reqs);
 	free(stats);
-
 	return 0;
 }

@@ -42,6 +42,65 @@ int gata_algorithm (int r, int b, char *sendbuf, int sendcount, MPI_Datatype sen
 	if (r > nprocs)        r = nprocs;     // r = P is valid (pairwise / linear)
 	if (b <= 0 || b > nprocs) b = nprocs;
 
+	// ---- Fast path: no-forwarding regime (r >= P-1) --------------------
+	// When r >= P-1 every non-zero position in [1, P) has at most one
+	// non-zero base-r digit, so each block is sent exactly once and the
+	// rotated `tmp` of the general path is a redundant permutation of
+	// `sendbuf`. Skip rotation entirely and exchange directly between
+	// `sendbuf` and `recvbuf`, still respecting the batch size `b`
+	// (sub-batch count = ceil((P-1)/b)).  This collapses to MPICH
+	// scattered (b<P-1) or basic linear (b>=P-1) at zero rotation cost.
+	if (r >= nprocs - 1) {
+		// Self block
+		memcpy(&recvbuf[(size_t)rank * block_size],
+		       &sendbuf[(size_t)rank * block_size], block_size);
+
+		int max_in_flight = (b > nprocs - 1) ? nprocs - 1 : b;
+		MPI_Request *reqs  = (MPI_Request *) malloc(2 * max_in_flight * sizeof(MPI_Request));
+		MPI_Status  *stats = (MPI_Status  *) malloc(2 * max_in_flight * sizeof(MPI_Status));
+		if (reqs == nullptr || stats == nullptr) {
+			fprintf(stderr, "gata: MPI request allocation failed (pairwise path)\n");
+			free(reqs); free(stats);
+			return 1;
+		}
+
+		for (int k = 1; k < nprocs; k += b) {
+			int ss = (nprocs - k < b) ? (nprocs - k) : b;
+			int num_reqs = 0;
+
+			// Phase 1: post ALL Irecv first (CXI match-list friendly)
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				int recv_peer = (rank - z + nprocs) % nprocs;
+				MPI_Irecv(&recvbuf[(size_t)recv_peer * block_size],
+				          block_size, MPI_CHAR,
+				          recv_peer, recv_peer + z, comm,
+				          &reqs[num_reqs++]);
+			}
+			// Phase 2: post ALL Isend
+			for (int s = 0; s < ss; s++) {
+				int z = k + s;
+				int send_peer = (rank + z) % nprocs;
+				MPI_Isend(&sendbuf[(size_t)send_peer * block_size],
+				          block_size, MPI_CHAR,
+				          send_peer, rank + z, comm,
+				          &reqs[num_reqs++]);
+			}
+
+			MPI_Waitall(num_reqs, reqs, stats);
+			for (int i = 0; i < num_reqs; i++) {
+				if (stats[i].MPI_ERROR != MPI_SUCCESS) {
+					fprintf(stderr, "gata: request %d error %d (pairwise path)\n",
+					        i, stats[i].MPI_ERROR);
+				}
+			}
+		}
+
+		free(reqs);
+		free(stats);
+		return 0;
+	}
+
 	// ---- Algorithm metadata --------------------------------------------
 	// w      = number of base-r digits needed for indices 0..nprocs-1
 	// nlpow  = r^(w-1), place value of the top digit
